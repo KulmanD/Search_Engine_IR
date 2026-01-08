@@ -1,0 +1,27 @@
+# pycharm / jetbrains
+.idea/
+*.iml
+
+# python virtual environment
+.venv/
+venv/
+env/
+
+# python cache / bytecode
+__pycache__/
+*.py[cod]
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# jupyter
+.ipynb_checkpoints/
+
+# macos
+.DS_Store
+
+# logs / temp
+*.log
+tmp/
