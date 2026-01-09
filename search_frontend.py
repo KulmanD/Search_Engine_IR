@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 import math
 import pickle
 import re
+import os
 from collections import Counter, defaultdict
 
 from google.cloud import storage
@@ -29,31 +30,85 @@ BASE_DIR = "postings_gcp"
 BODY_INDEX = None  # InvertedIndex
 ID2TITLE = None    # dict[int,str]  (we will load in a later stage)
 
+# total number of documents in wikipedia corpus (from course artifacts); used for idf
+# we will try to infer it from the index stats if possible, otherwise fall back to this constant.
+N_DOCS_FALLBACK = 6348910
+
+def _get_N_docs():
+  # best effort: infer N from df stats if possible
+  # if we cannot, fall back to a known wikipedia size used in the course.
+  try:
+    # df values are <= N, so max(df) is a lower bound; not perfect but better than nothing
+    mx = max(BODY_INDEX.df.values()) if BODY_INDEX is not None else 0
+    return max(mx, N_DOCS_FALLBACK)
+  except Exception:
+    return N_DOCS_FALLBACK
+
+def _ensure_id2title_loaded():
+  global ID2TITLE
+  if ID2TITLE is not None:
+    return
+
+  # where we uploaded it in step 1
+  blob_path = "artifacts/id2title.pickle"
+
+  client = storage.Client()
+  bucket = client.bucket(BUCKET_NAME)
+  blob = bucket.blob(blob_path)
+
+  try:
+    # if it doesn't exist yet, keep working with doc_id as "title"
+    if not blob.exists():
+      print(f"[startup] id2title not found: gs://{BUCKET_NAME}/{blob_path} (returning doc_id as title for now)")
+      ID2TITLE = None
+      return
+
+    print(f"[startup] loading id2title from gs://{BUCKET_NAME}/{blob_path} ...")
+    data = blob.download_as_bytes()
+    ID2TITLE = pickle.loads(data)
+    print(f"[startup] loaded id2title entries: {len(ID2TITLE)}")
+  except Exception as e:
+    print(f"[startup] failed loading id2title from gs://{BUCKET_NAME}/{blob_path}: {e}")
+    ID2TITLE = None
+    return
+
+def _doc_to_title(doc_id: int):
+  if ID2TITLE is None:
+    return str(doc_id)
+  return ID2TITLE.get(doc_id, str(doc_id))
+
+def _topk(score_dict, k: int):
+  # score_dict: doc_id -> float
+  if not score_dict:
+    return []
+  return sorted(score_dict.items(), key=lambda x: x[1], reverse=True)[:k]
+
 # ----------------------------
 # tokenizer (assignment 3 style)
 # ----------------------------
 import nltk
 from nltk.corpus import stopwords
 
-# staff-style regex used in assignment 3 gcp part
 RE_WORD = re.compile(r"""[\#\@\w](['\-]?\w){2,24}""", re.UNICODE)
 
-# corpus stopwords (same set used in the course notebooks)
-CORPUS_STOPWORDS = {
-    "category", "references", "also", "external", "links", "may", "first", "see",
-    "history", "people", "one", "two", "part", "thumb", "including", "second",
-    "following", "many", "however", "would", "became"
+# robust: download stopwords if missing in the local env
+try:
+    english_stopwords = set(stopwords.words("english"))
+except LookupError:
+    nltk.download("stopwords")
+    english_stopwords = set(stopwords.words("english"))
+corpus_stopwords = {
+    "category", "references", "also", "links",
+    "extenal", "see", "thumb"
 }
 
+all_stopwords = english_stopwords.union(corpus_stopwords)
+
 def tokenize(text: str):
-    # lower + regex tokenize + stopword removal
     if not text:
         return []
-    english_stopwords = set(stopwords.words("english"))
-    all_stopwords = english_stopwords.union(CORPUS_STOPWORDS)
     tokens = [m.group() for m in RE_WORD.finditer(text.lower())]
     return [t for t in tokens if t not in all_stopwords]
-
 # ----------------------------
 # gcs helpers: auto-detect index pickle and load it
 # ----------------------------
@@ -162,24 +217,67 @@ def search_body():
       except Exception as e:
         return jsonify({"error": f"body index not loaded: {e}"})
 
-    # debug: fetch df + posting length for the first token
+    _ensure_id2title_loaded()
+
     tokens = tokenize(query)
     if len(tokens) == 0:
       return jsonify(res)
 
-    t0 = tokens[0]
-    try:
-      pl = BODY_INDEX.read_a_posting_list(BASE_DIR, t0, bucket_name=BUCKET_NAME)
-    except Exception as e:
-      return jsonify({"error": f"failed reading posting list for '{t0}': {e}"})
+    # query term frequencies
+    q_tf = Counter(tokens)
 
-    # return a small debug payload for now
-    return jsonify({
-      "token": t0,
-      "df": int(BODY_INDEX.df.get(t0, 0)),
-      "posting_len": len(pl),
-      "sample": pl[:5]
-    })
+    # idf + query tf-idf weights
+    N = _get_N_docs()
+    q_weights = {}
+    for t, tf in q_tf.items():
+      df = BODY_INDEX.df.get(t, 0)
+      if df == 0:
+        continue
+      idf = math.log10(N / df)
+      q_weights[t] = (tf / len(tokens)) * idf
+
+    if len(q_weights) == 0:
+      return jsonify(res)
+
+    # accumulate dot product scores: doc_id -> sum(w_q * w_d)
+    scores = defaultdict(float)
+    # also track doc weight squares for cosine denom (since we don't have precomputed norms yet)
+    doc_sq = defaultdict(float)
+
+    for t, wq in q_weights.items():
+      try:
+        pl = BODY_INDEX.read_a_posting_list(BASE_DIR, t, bucket_name=BUCKET_NAME)
+      except Exception:
+        continue
+
+      df = BODY_INDEX.df.get(t, 0)
+      if df == 0:
+        continue
+      idf = math.log10(N / df)
+
+      for doc_id, tf in pl:
+        # normalize tf by doc length is better, but we don't have lengths from A3 artifacts here.
+        # use log-tf variant to keep things stable.
+        wd = (1.0 + math.log10(tf)) * idf
+        scores[doc_id] += wq * wd
+        doc_sq[doc_id] += wd * wd
+
+    # cosine normalize by (||q|| * ||d||)
+    q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
+    if q_norm == 0.0:
+      return jsonify(res)
+
+    for doc_id in list(scores.keys()):
+      d_norm = math.sqrt(doc_sq.get(doc_id, 0.0))
+      if d_norm == 0.0:
+        scores[doc_id] = 0.0
+      else:
+        scores[doc_id] = scores[doc_id] / (q_norm * d_norm)
+
+    top = _topk(scores, 100)
+
+    # return (wiki_id, title) tuples. for now title is doc_id string until we load id2title.
+    return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _ in top])
     # END SOLUTION
 
 @app.route("/search_title")
