@@ -1,14 +1,13 @@
 #!/bin/bash
 set -e
 
-APP_USER="shhara"
+APP_USER="ubuntu"
 APP_HOME="/home/${APP_USER}"
 VENV_DIR="${APP_HOME}/venv"
 
 apt-get update
 apt-get install -y python3-venv python3-pip
 
-# Create venv as the normal user (not root)
 sudo -u "${APP_USER}" bash -lc "
 python3 -m venv '${VENV_DIR}'
 source '${VENV_DIR}/bin/activate'
@@ -21,4 +20,9 @@ pip install \
   'pandas' \
   'google-cloud-storage' \
   'numpy>=1.23.2,<3'
+python3 - <<'PY'
+import nltk
+nltk.download('stopwords')
+print('nltk stopwords ok')
+PY
 "

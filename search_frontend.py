@@ -3,134 +3,128 @@ from flask import Flask, request, jsonify
 import math
 import pickle
 import re
-import os
 from collections import Counter, defaultdict
-
+from functools import lru_cache
+import os
+import nltk
+from nltk.corpus import stopwords
 from google.cloud import storage
 
 from inverted_index_gcp import InvertedIndex
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+ENABLE_ANCHOR = os.getenv("ENABLE_ANCHOR", "0") == "1"
+# ----------------------------
+# flask app
+# ----------------------------
 class MyFlaskApp(Flask):
     def run(self, host=None, port=None, debug=None, **options):
         super(MyFlaskApp, self).run(host=host, port=port, debug=debug, **options)
 
+
 app = MyFlaskApp(__name__)
-app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+app.config["JSONIFY_PRETTYPRINT_REGULAR"] = False
+
 
 # ----------------------------
-# gcs / artifacts configuration
+# gcs configuration (matches your current bucket)
 # ----------------------------
-# this is your existing assignment-3 bucket
 BUCKET_NAME = "information-retrival-ex3"
+# ----------------------------
+# runtime feature flags
+# ----------------------------
+# set env ENABLE_ANCHOR=1 to enable anchor endpoints/scoring
+# default is OFF so we don't load anchor routing tables/shards unless needed.
+ENABLE_ANCHOR = os.getenv("ENABLE_ANCHOR", "0").strip().lower() in {"1", "true", "yes", "on"}
 
-# folder (prefix) inside the bucket that contains your posting bins + index pickle(s)
-BASE_DIR = "postings_gcp"
-
-# globals loaded once at startup
+# body
+BODY_BASE_DIR = "postings_gcp"  # gs://BUCKET/postings_gcp/...
 BODY_INDEX = None  # InvertedIndex
-ID2TITLE = None    # dict[int,str]  (we will load in a later stage)
 
-# total number of documents in wikipedia corpus (from course artifacts); used for idf
-# we will try to infer it from the index stats if possible, otherwise fall back to this constant.
+# title
+TITLE_BASE_DIR = "title_postings_gcp/title_postings_gcp"
+TITLE_INDEX_NAME = "title_index"
+TITLE_INDEX = None  # InvertedIndex
+
+# anchor (sharded)
+ANCHOR_PARTS_DIR = "anchor_parts"  # gs://BUCKET/anchor_parts/part_000/...
+ANCHOR_PARTS_N = 60
+TERM2PARTS_BLOB = "anchor_parts/term2parts_u64.pkl"
+TERM2BITS = None  # dict[str,int] term -> uint64 bitset
+
+# global artifacts
+ID2TITLE_BLOB = "artifacts/id2title.pickle"
+PAGERANK_BLOB = "artifacts/pagerank.pickle"
+PAGEVIEW_BLOB = "artifacts/pageview_aug2021.pickle"  # optional; not required for minimum
+
+ID2TITLE = None  # dict[int,str]
+PAGERANK = None  # dict or list
+PAGEVIEW = None  # dict or list (optional)
+
 N_DOCS_FALLBACK = 6348910
 
-def _get_N_docs():
-  # best effort: infer N from df stats if possible
-  # if we cannot, fall back to a known wikipedia size used in the course.
-  try:
-    # df values are <= N, so max(df) is a lower bound; not perfect but better than nothing
-    mx = max(BODY_INDEX.df.values()) if BODY_INDEX is not None else 0
-    return max(mx, N_DOCS_FALLBACK)
-  except Exception:
-    return N_DOCS_FALLBACK
-
-def _ensure_id2title_loaded():
-  global ID2TITLE
-  if ID2TITLE is not None:
-    return
-
-  # where we uploaded it in step 1
-  blob_path = "artifacts/id2title.pickle"
-
-  client = storage.Client()
-  bucket = client.bucket(BUCKET_NAME)
-  blob = bucket.blob(blob_path)
-
-  try:
-    # if it doesn't exist yet, keep working with doc_id as "title"
-    if not blob.exists():
-      print(f"[startup] id2title not found: gs://{BUCKET_NAME}/{blob_path} (returning doc_id as title for now)")
-      ID2TITLE = None
-      return
-
-    print(f"[startup] loading id2title from gs://{BUCKET_NAME}/{blob_path} ...")
-    data = blob.download_as_bytes()
-    ID2TITLE = pickle.loads(data)
-    print(f"[startup] loaded id2title entries: {len(ID2TITLE)}")
-  except Exception as e:
-    print(f"[startup] failed loading id2title from gs://{BUCKET_NAME}/{blob_path}: {e}")
-    ID2TITLE = None
-    return
-
-def _doc_to_title(doc_id: int):
-  if ID2TITLE is None:
-    return str(doc_id)
-  return ID2TITLE.get(doc_id, str(doc_id))
-
-def _topk(score_dict, k: int):
-  # score_dict: doc_id -> float
-  if not score_dict:
-    return []
-  return sorted(score_dict.items(), key=lambda x: x[1], reverse=True)[:k]
 
 # ----------------------------
-# tokenizer (assignment 3 style)
+# tokenizer (staff tokenizer style from assignment 3)
 # ----------------------------
-import nltk
-from nltk.corpus import stopwords
-
 RE_WORD = re.compile(r"""[\#\@\w](['\-]?\w){2,24}""", re.UNICODE)
 
-# robust: download stopwords if missing in the local env
 try:
-    english_stopwords = set(stopwords.words("english"))
+    english_stopwords = frozenset(stopwords.words("english"))
 except LookupError:
     nltk.download("stopwords")
-    english_stopwords = set(stopwords.words("english"))
+    english_stopwords = frozenset(stopwords.words("english"))
+
 corpus_stopwords = {
-    "category", "references", "also", "links",
-    "extenal", "see", "thumb"
+    "category", "references", "also", "external", "links",
+    "may", "first", "see", "history", "people", "one", "two",
+    "part", "thumb", "including", "second", "following",
+    "many", "however", "would", "became",
 }
 
-all_stopwords = english_stopwords.union(corpus_stopwords)
+ALL_STOPWORDS = english_stopwords.union(corpus_stopwords)
+
 
 def tokenize(text: str):
     if not text:
         return []
     tokens = [m.group() for m in RE_WORD.finditer(text.lower())]
-    return [t for t in tokens if t not in all_stopwords]
-# ----------------------------
-# gcs helpers: auto-detect index pickle and load it
-# ----------------------------
-def _gcs_list_pickles(bucket_name: str, prefix: str):
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    # list blobs under prefix
-    blobs = bucket.list_blobs(prefix=prefix + "/")
-    pickles = []
-    for b in blobs:
-        name = b.name
-        if name.endswith(".pickle") or name.endswith(".pkl"):
-            pickles.append(name)
-    return sorted(pickles)
+    return [t for t in tokens if t not in ALL_STOPWORDS]
 
-def _auto_detect_index_name(bucket_name: str, base_dir: str):
+
+# ----------------------------
+# gcs helpers
+# ----------------------------
+def _gcs_client():
+    return storage.Client()
+
+
+def _gcs_download_pickle(blob_path: str):
+    c = _gcs_client()
+    b = c.bucket(BUCKET_NAME)
+    blob = b.blob(blob_path)
+    if not blob.exists():
+        return None
+    return pickle.loads(blob.download_as_bytes())
+
+
+def _gcs_list_pickles(prefix: str):
+    c = _gcs_client()
+    b = c.bucket(BUCKET_NAME)
+    blobs = b.list_blobs(prefix=prefix.rstrip("/") + "/")
+    out = []
+    for bl in blobs:
+        name = bl.name
+        if name.endswith(".pickle") or name.endswith(".pkl"):
+            out.append(name)
+    return sorted(out)
+
+
+def _auto_detect_index_name(base_dir: str):
     """
-    find the main index pickle name (without extension) inside base_dir.
-    we ignore *_posting_locs.pickle because that is only the posting locations table.
+    Detect main index pickle name (without extension) under base_dir.
+    Skip *_posting_locs.pickle.
     """
-    pickles = _gcs_list_pickles(bucket_name, base_dir)
-    # keep only files directly under base_dir
+    pickles = _gcs_list_pickles(base_dir)
     candidates = []
     for p in pickles:
         base = p.split("/")[-1]
@@ -142,26 +136,224 @@ def _auto_detect_index_name(bucket_name: str, base_dir: str):
             candidates.append(base[:-4])
     return candidates[0] if candidates else None
 
+
+# ----------------------------
+# load-once artifacts
+# ----------------------------
+def _ensure_id2title_loaded():
+    global ID2TITLE
+    if ID2TITLE is not None:
+        return
+    obj = _gcs_download_pickle(ID2TITLE_BLOB)
+    if obj is None:
+        print(f"[startup] id2title not found: gs://{BUCKET_NAME}/{ID2TITLE_BLOB} (using doc_id as title)")
+        ID2TITLE = {}
+        return
+    ID2TITLE = obj
+    print(f"[startup] loaded id2title entries: {len(ID2TITLE):,}")
+
+
+def _doc_to_title(doc_id: int) -> str:
+    if not ID2TITLE:
+        return str(doc_id)
+    return ID2TITLE.get(doc_id, str(doc_id))
+
+
+def _ensure_pagerank_loaded():
+    global PAGERANK
+    if PAGERANK is not None:
+        return
+    obj = _gcs_download_pickle(PAGERANK_BLOB)
+    if obj is None:
+        print(f"[startup] pagerank not found: gs://{BUCKET_NAME}/{PAGERANK_BLOB} (returning 0.0)")
+        PAGERANK = {}
+        return
+    PAGERANK = obj
+    try:
+        ln = len(PAGERANK)
+    except Exception:
+        ln = -1
+    print(f"[startup] loaded pagerank ({type(PAGERANK).__name__}), len={ln}")
+
+
+def _ensure_pageview_loaded():
+    """
+    PageView is optional for minimum. If missing, we just return 0.
+    """
+    global PAGEVIEW
+    if PAGEVIEW is not None:
+        return
+    obj = _gcs_download_pickle(PAGEVIEW_BLOB)
+    if obj is None:
+        print(f"[startup] pageview not found: gs://{BUCKET_NAME}/{PAGEVIEW_BLOB} (returning 0)")
+        PAGEVIEW = {}
+        return
+    PAGEVIEW = obj
+    try:
+        ln = len(PAGEVIEW)
+    except Exception:
+        ln = -1
+    print(f"[startup] loaded pageview ({type(PAGEVIEW).__name__}), len={ln}")
+
+
+def _pr_of(doc_id: int) -> float:
+    if not PAGERANK:
+        return 0.0
+    if isinstance(PAGERANK, dict):
+        if doc_id in PAGERANK:
+            return float(PAGERANK.get(doc_id, 0.0))
+        # sometimes keys are strings
+        return float(PAGERANK.get(str(doc_id), 0.0))
+    if 0 <= doc_id < len(PAGERANK):
+        return float(PAGERANK[doc_id])
+    return 0.0
+
+
+def _pv_of(doc_id: int) -> int:
+    if not PAGEVIEW:
+        return 0
+    if isinstance(PAGEVIEW, dict):
+        if doc_id in PAGEVIEW:
+            return int(PAGEVIEW.get(doc_id, 0))
+        return int(PAGEVIEW.get(str(doc_id), 0))
+    if 0 <= doc_id < len(PAGEVIEW):
+        return int(PAGEVIEW[doc_id])
+    return 0
+
+
+# ----------------------------
+# debug endpoints (safe to keep; not used by graders)
+# ----------------------------
+@app.route("/debug_pagerank")
+def debug_pagerank():
+    """debug: verify pagerank loaded + key type + sample values"""
+    _ensure_pagerank_loaded()
+
+    if not PAGERANK:
+        return jsonify({"loaded": False, "type": None, "len": 0})
+
+    # dict-based pagerank
+    if isinstance(PAGERANK, dict):
+        keys = list(PAGERANK.keys())
+        sample_keys = keys[:5]
+        sample = []
+        for k in sample_keys:
+            try:
+                sample.append([str(k), float(PAGERANK.get(k, 0.0))])
+            except Exception:
+                sample.append([str(k), 0.0])
+
+        return jsonify({
+            "loaded": True,
+            "type": "dict",
+            "len": len(PAGERANK),
+            "sample": sample,
+            "has_int_1": (1 in PAGERANK),
+            "has_str_1": ("1" in PAGERANK),
+            "val_1": _pr_of(1),
+            "val_5": _pr_of(5),
+            "val_8": _pr_of(8),
+        })
+
+    # list-based pagerank
+    try:
+        ln = len(PAGERANK)
+    except Exception:
+        ln = -1
+
+    v1 = float(PAGERANK[1]) if ln > 1 else None
+    v5 = float(PAGERANK[5]) if ln > 5 else None
+    v8 = float(PAGERANK[8]) if ln > 8 else None
+
+    return jsonify({
+        "loaded": True,
+        "type": "list",
+        "len": ln,
+        "val_1": v1,
+        "val_5": v5,
+        "val_8": v8,
+    })
+
+
+# ----------------------------
+# indexes
+# ----------------------------
 def _load_body_index():
     global BODY_INDEX
     if BODY_INDEX is not None:
         return
-    name = _auto_detect_index_name(BUCKET_NAME, BASE_DIR)
+    name = _auto_detect_index_name(BODY_BASE_DIR)
     if name is None:
-        # keep the server up, but make it obvious what's missing
-        print(f"[startup] no index pickle found in gs://{BUCKET_NAME}/{BASE_DIR}/")
-        BODY_INDEX = None
+        raise RuntimeError(f"no body index pickle found under gs://{BUCKET_NAME}/{BODY_BASE_DIR}/")
+    print(f"[startup] loading body index: gs://{BUCKET_NAME}/{BODY_BASE_DIR}/{name}.pickle")
+    BODY_INDEX = InvertedIndex.read_index(BODY_BASE_DIR, name, bucket_name=BUCKET_NAME)
+
+
+def _load_title_index():
+    global TITLE_INDEX
+    if TITLE_INDEX is not None:
         return
-    print(f"[startup] loading body index: gs://{BUCKET_NAME}/{BASE_DIR}/{name}.pickle")
-    BODY_INDEX = InvertedIndex.read_index(BASE_DIR, name, bucket_name=BUCKET_NAME)
+    print(f"[startup] loading title index: gs://{BUCKET_NAME}/{TITLE_BASE_DIR}/{TITLE_INDEX_NAME}.pkl")
+    TITLE_INDEX = InvertedIndex.read_index(TITLE_BASE_DIR, TITLE_INDEX_NAME, bucket_name=BUCKET_NAME)
 
-# load on startup (safe: if bucket auth is missing it will print an error later)
-try:
-    _load_body_index()
-except Exception as e:
-    print(f"[startup] failed to load index from gcs: {e}")
-    BODY_INDEX = None
 
+def _ensure_term2bits_loaded():
+    global TERM2BITS
+    # anchor feature disabled -> never load term2parts
+    if not ENABLE_ANCHOR:
+        if TERM2BITS is None:
+            TERM2BITS = {}
+        return
+    if TERM2BITS is not None:
+        return
+    print(f"[startup] loading term2parts from gs://{BUCKET_NAME}/{TERM2PARTS_BLOB} ...")
+    obj = _gcs_download_pickle(TERM2PARTS_BLOB)
+    if obj is None:
+        print(f"[startup] term2parts not found: gs://{BUCKET_NAME}/{TERM2PARTS_BLOB}")
+        TERM2BITS = {}
+        return
+    TERM2BITS = obj
+    print(f"[startup] loaded term2parts terms: {len(TERM2BITS):,}")
+
+
+def _iter_set_bits_u64(bits: int):
+    b = bits & ((1 << 64) - 1)
+    while b:
+        lsb = b & -b
+        i = (lsb.bit_length() - 1)
+        yield i
+        b ^= lsb
+def _anchor_fetch_posting(part_id: int, term: str):
+    """fetch posting list for (term) from one anchor shard; returns list[(doc_id, tf)] or []"""
+    try:
+        idx = _get_anchor_part_index(part_id)
+        return idx.read_a_posting_list(f"{ANCHOR_PARTS_DIR}/part_{part_id:03d}", term, bucket_name=BUCKET_NAME)
+    except Exception:
+        return []
+
+@lru_cache(maxsize=64)
+def _get_anchor_part_index(part_id: int) -> InvertedIndex:
+    base_dir = f"{ANCHOR_PARTS_DIR}/part_{part_id:03d}"
+    return InvertedIndex.read_index(base_dir, "anchor_index", bucket_name=BUCKET_NAME)
+
+
+# ----------------------------
+# scoring helpers
+# ----------------------------
+def _get_N_docs():
+    return N_DOCS_FALLBACK
+
+
+def _topk(score_dict, k: int):
+    if not score_dict:
+        return []
+    # stable: score desc, doc_id asc
+    return sorted(score_dict.items(), key=lambda x: (-x[1], x[0]))[:k]
+
+
+# ----------------------------
+# endpoints (staff template signatures)
+# ----------------------------
 @app.route("/search")
 def search():
     ''' Returns up to a 100 of your best search results for the query. This is
@@ -181,13 +373,158 @@ def search():
         element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get('query', '')
+    query = request.args.get("query", "")
     if len(query) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
+        return jsonify(res)
 
+    # BEGIN SOLUTION
+    if BODY_INDEX is None:
+        _load_body_index()
+    if TITLE_INDEX is None:
+        _load_title_index()
+
+    _ensure_id2title_loaded()
+    if ENABLE_ANCHOR:
+        _ensure_term2bits_loaded()
+    _ensure_pagerank_loaded()
+    _ensure_pageview_loaded()
+
+    tokens = tokenize(query)
+    if not tokens:
+        return jsonify(res)
+
+    # ---- body tf-idf cosine (candidate generation) ----
+    q_tf = Counter(tokens)
+    N = _get_N_docs()
+
+    q_weights = {}
+    for t, tf in q_tf.items():
+        df = BODY_INDEX.df.get(t, 0)
+        if df <= 0:
+            continue
+        idf = math.log10(N / df)
+        q_weights[t] = (tf / len(tokens)) * idf
+
+    body_scores = defaultdict(float)
+    body_doc_sq = defaultdict(float)
+
+    for t, wq in q_weights.items():
+        try:
+            pl = BODY_INDEX.read_a_posting_list(BODY_BASE_DIR, t, bucket_name=BUCKET_NAME)
+        except Exception:
+            continue
+
+        df = BODY_INDEX.df.get(t, 0)
+        if df <= 0:
+            continue
+        idf = math.log10(N / df)
+
+        for doc_id, tf in pl:
+            wd = (1.0 + math.log10(tf)) * idf
+            body_scores[doc_id] += wq * wd
+            body_doc_sq[doc_id] += wd * wd
+
+    q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
+    if q_norm > 0.0:
+        for doc_id in list(body_scores.keys()):
+            d_norm = math.sqrt(body_doc_sq.get(doc_id, 0.0))
+            if d_norm > 0.0:
+                body_scores[doc_id] /= (q_norm * d_norm)
+            else:
+                body_scores[doc_id] = 0.0
+
+    body_top = _topk(body_scores, 200)
+
+    # ---- title: distinct query words in title ----
+    title_scores = defaultdict(float)
+    q_terms = set(tokens)
+    for t in q_terms:
+        if TITLE_INDEX.df.get(t, 0) <= 0:
+            continue
+        try:
+            pl = TITLE_INDEX.read_a_posting_list(TITLE_BASE_DIR, t, bucket_name=BUCKET_NAME)
+        except Exception:
+            continue
+        for doc_id, _tf in pl:
+            title_scores[doc_id] += 1.0
+
+    # ---- anchor: number of query word occurrences that appear in anchor text ----
+    anchor_scores = defaultdict(float)
+    if ENABLE_ANCHOR:
+        anchor_tasks = []
+        for t in tokens:
+            bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
+            if bits == 0:
+                continue
+            for part_id in _iter_set_bits_u64(bits):
+                if part_id >= ANCHOR_PARTS_N:
+                    continue
+                anchor_tasks.append((part_id, t))
+
+        if anchor_tasks:
+            max_workers = 64
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_anchor_fetch_posting, pid, term) for pid, term in anchor_tasks]
+                for fut in as_completed(futs):
+                    pl = fut.result()
+                    for doc_id, _tf in pl:
+                        anchor_scores[doc_id] += 1.0
+    # ---- anchor: number of query word occurrences that appear in anchor text ----
+    anchor_scores = defaultdict(float)
+
+    anchor_tasks = []
+    for t in tokens:  # keep duplicates per staff anchor spec
+        bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
+        if bits == 0:
+            continue
+        for part_id in _iter_set_bits_u64(bits):
+            if part_id >= ANCHOR_PARTS_N:
+                continue
+            anchor_tasks.append((part_id, t))
+
+    if anchor_tasks:
+        max_workers = 64
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(_anchor_fetch_posting, pid, term) for pid, term in anchor_tasks]
+            for fut in as_completed(futs):
+                pl = fut.result()
+                for doc_id, _tf in pl:
+                    anchor_scores[doc_id] += 1.0
+
+    # ---- merge (deterministic) ----
+    W_BODY = 1.0
+    W_TITLE = 0.25
+    W_ANCHOR = 0.20 if ENABLE_ANCHOR else 0.0
+    W_PR = 0.10
+    W_PV = 0.0  # pageview file not present -> keep disabled for minimum
+
+    merged = defaultdict(float)
+
+    # start from body candidates
+    for doc_id, s in body_top:
+        merged[doc_id] += W_BODY * float(s)
+
+    # add title + anchor (can introduce extra docs)
+    for doc_id, s in title_scores.items():
+        merged[doc_id] += W_TITLE * float(s)
+    for doc_id, s in anchor_scores.items():
+        merged[doc_id] += W_ANCHOR * float(s)
+
+    # pagerank / pageview boosts (log-scaled)
+    for doc_id in list(merged.keys()):
+        pr = _pr_of(int(doc_id))
+        if pr > 0.0:
+            merged[doc_id] += W_PR * math.log1p(pr)
+
+        if W_PV > 0.0:
+            pv = _pv_of(int(doc_id))
+            if pv > 0:
+                merged[doc_id] += W_PV * math.log1p(pv)
+
+    top = _topk(merged, 100)
+    return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _ in top])
     # END SOLUTION
-    return jsonify(res)
+
 
 @app.route("/search_body")
 def search_body():
@@ -206,91 +543,79 @@ def search_body():
         element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get('query', '')
+    query = request.args.get("query", "")
     if len(query) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
-    # ensure index is loaded
-    if BODY_INDEX is None:
-      try:
-        _load_body_index()
-      except Exception as e:
-        return jsonify({"error": f"body index not loaded: {e}"})
+        return jsonify(res)
 
+    # BEGIN SOLUTION
+    if BODY_INDEX is None:
+        _load_body_index()
     _ensure_id2title_loaded()
 
     tokens = tokenize(query)
-    if len(tokens) == 0:
-      return jsonify(res)
+    if not tokens:
+        return jsonify(res)
 
-    # query term frequencies
     q_tf = Counter(tokens)
-
-    # idf + query tf-idf weights
     N = _get_N_docs()
+
     q_weights = {}
     for t, tf in q_tf.items():
-      df = BODY_INDEX.df.get(t, 0)
-      if df == 0:
-        continue
-      idf = math.log10(N / df)
-      q_weights[t] = (tf / len(tokens)) * idf
+        df = BODY_INDEX.df.get(t, 0)
+        if df <= 0:
+            continue
+        idf = math.log10(N / df)
+        q_weights[t] = (tf / len(tokens)) * idf
 
-    if len(q_weights) == 0:
-      return jsonify(res)
+    if not q_weights:
+        return jsonify(res)
 
-    # accumulate dot product scores: doc_id -> sum(w_q * w_d)
     scores = defaultdict(float)
-    # also track doc weight squares for cosine denom (since we don't have precomputed norms yet)
     doc_sq = defaultdict(float)
 
     for t, wq in q_weights.items():
-      try:
-        pl = BODY_INDEX.read_a_posting_list(BASE_DIR, t, bucket_name=BUCKET_NAME)
-      except Exception:
-        continue
+        try:
+            pl = BODY_INDEX.read_a_posting_list(BODY_BASE_DIR, t, bucket_name=BUCKET_NAME)
+        except Exception:
+            continue
 
-      df = BODY_INDEX.df.get(t, 0)
-      if df == 0:
-        continue
-      idf = math.log10(N / df)
+        df = BODY_INDEX.df.get(t, 0)
+        if df <= 0:
+            continue
+        idf = math.log10(N / df)
 
-      for doc_id, tf in pl:
-        # normalize tf by doc length is better, but we don't have lengths from A3 artifacts here.
-        # use log-tf variant to keep things stable.
-        wd = (1.0 + math.log10(tf)) * idf
-        scores[doc_id] += wq * wd
-        doc_sq[doc_id] += wd * wd
+        for doc_id, tf in pl:
+            wd = (1.0 + math.log10(tf)) * idf
+            scores[doc_id] += wq * wd
+            doc_sq[doc_id] += wd * wd
 
-    # cosine normalize by (||q|| * ||d||)
     q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
-    if q_norm == 0.0:
-      return jsonify(res)
+    if q_norm <= 0.0:
+        return jsonify(res)
 
     for doc_id in list(scores.keys()):
-      d_norm = math.sqrt(doc_sq.get(doc_id, 0.0))
-      if d_norm == 0.0:
-        scores[doc_id] = 0.0
-      else:
-        scores[doc_id] = scores[doc_id] / (q_norm * d_norm)
+        d_norm = math.sqrt(doc_sq.get(doc_id, 0.0))
+        if d_norm > 0.0:
+            scores[doc_id] /= (q_norm * d_norm)
+        else:
+            scores[doc_id] = 0.0
 
     top = _topk(scores, 100)
-
-    # return (wiki_id, title) tuples. for now title is doc_id string until we load id2title.
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _ in top])
     # END SOLUTION
 
+
 @app.route("/search_title")
 def search_title():
-    ''' Returns ALL (not just top 100) search results that contain A QUERY WORD 
-        IN THE TITLE of articles, ordered in descending order of the NUMBER OF 
-        DISTINCT QUERY WORDS that appear in the title. DO NOT use stemming. DO 
-        USE the staff-provided tokenizer from Assignment 3 (GCP part) to do the 
-        tokenization and remove stopwords. For example, a document 
-        with a title that matches two distinct query words will be ranked before a 
-        document with a title that matches only one distinct query word, 
-        regardless of the number of times the term appeared in the title (or 
-        query). 
+    ''' Returns ALL (not just top 100) search results that contain A QUERY WORD
+        IN THE TITLE of articles, ordered in descending order of the NUMBER OF
+        DISTINCT QUERY WORDS that appear in the title. DO NOT use stemming. DO
+        USE the staff-provided tokenizer from Assignment 3 (GCP part) to do the
+        tokenization and remove stopwords. For example, a document
+        with a title that matches two distinct query words will be ranked before a
+        document with a title that matches only one distinct query word,
+        regardless of the number of times the term appeared in the title (or
+        query).
 
         Test this by navigating to the a URL like:
          http://YOUR_SERVER_DOMAIN/search_title?query=hello+world
@@ -298,29 +623,55 @@ def search_title():
         if you're using ngrok on Colab or your external IP on GCP.
     Returns:
     --------
-        list of ALL (not just top 100) search results, ordered from best to 
+        list of ALL (not just top 100) search results, ordered from best to
         worst where each element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get('query', '')
+    query = request.args.get("query", "")
     if len(query) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
+        return jsonify(res)
 
+    # BEGIN SOLUTION
+    if TITLE_INDEX is None:
+        _load_title_index()
+    _ensure_id2title_loaded()
+
+    tokens = tokenize(query)
+    if not tokens:
+        return jsonify(res)
+
+    q_terms = set(tokens)
+    match_counts = defaultdict(int)
+
+    for t in q_terms:
+        if TITLE_INDEX.df.get(t, 0) <= 0:
+            continue
+        try:
+            pl = TITLE_INDEX.read_a_posting_list(TITLE_BASE_DIR, t, bucket_name=BUCKET_NAME)
+        except Exception:
+            continue
+        for doc_id, _tf in pl:
+            match_counts[doc_id] += 1
+
+    if not match_counts:
+        return jsonify(res)
+
+    ranked = sorted(match_counts.items(), key=lambda x: (-x[1], x[0]))
+    return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _c in ranked])
     # END SOLUTION
-    return jsonify(res)
+
 
 @app.route("/search_anchor")
 def search_anchor():
-    ''' Returns ALL (not just top 100) search results that contain A QUERY WORD 
-        IN THE ANCHOR TEXT of articles, ordered in descending order of the 
-        NUMBER OF QUERY WORDS that appear in anchor text linking to the page. 
-        DO NOT use stemming. DO USE the staff-provided tokenizer from Assignment 
-        3 (GCP part) to do the tokenization and remove stopwords. For example, 
-        a document with a anchor text that matches two distinct query words will 
-        be ranked before a document with anchor text that matches only one 
-        distinct query word, regardless of the number of times the term appeared 
-        in the anchor text (or query). 
+    ''' Returns ALL (not just top 100) search results that contain A QUERY WORD
+        IN THE ANCHOR TEXT of articles, ordered in descending order of the
+        NUMBER OF QUERY WORDS that appear in anchor text linking to the page.
+        DO NOT use stemming. DO USE the staff-provided tokenizer from Assignment
+        3 (GCP part) to do the tokenization and remove stopwords. For example,
+        a document with a anchor text that matches two distinct query words will
+        be ranked before a document with anchor text that matches only one
+        distinct query word, regardless of the number of times the term appeared
+        in the anchor text (or query).
 
         Test this by navigating to the a URL like:
          http://YOUR_SERVER_DOMAIN/search_anchor?query=hello+world
@@ -328,21 +679,75 @@ def search_anchor():
         if you're using ngrok on Colab or your external IP on GCP.
     Returns:
     --------
-        list of ALL (not just top 100) search results, ordered from best to 
+        list of ALL (not just top 100) search results, ordered from best to
         worst where each element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get('query', '')
+    query = request.args.get("query", "")
     if len(query) == 0:
-      return jsonify(res)
+        return jsonify(res)
+    if not ENABLE_ANCHOR:
+        return jsonify(res)  # (or return ("disabled", 501) if you prefer)
     # BEGIN SOLUTION
-    
-    # END SOLUTION
-    return jsonify(res)
+    _ensure_id2title_loaded()
+    tokens = tokenize(query)
+    if not tokens:
+        return jsonify(res)
 
-@app.route("/get_pagerank", methods=['POST'])
+    # match_counts = defaultdict(int)
+    #
+    # for t in tokens:  # keep duplicates per staff anchor spec
+    #     bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
+    #     if bits == 0:
+    #         continue
+    #
+    #     for part_id in _iter_set_bits_u64(bits):
+    #         if part_id >= ANCHOR_PARTS_N:
+    #             continue
+    #         try:
+    #             idx = _get_anchor_part_index(part_id)
+    #             pl = idx.read_a_posting_list(f"{ANCHOR_PARTS_DIR}/part_{part_id:03d}", t, bucket_name=BUCKET_NAME)
+    #         except Exception:
+    #             continue
+    #
+    #         for doc_id, _tf in pl:
+    #             match_counts[doc_id] += 1
+    match_counts = defaultdict(int)
+
+    # build tasks: one (part_id, term) per relevant shard for that term
+    tasks = []
+    for t in tokens:  # keep duplicates per staff anchor spec
+        bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
+        if bits == 0:
+            continue
+        for part_id in _iter_set_bits_u64(bits):
+            if part_id >= ANCHOR_PARTS_N:
+                continue
+            tasks.append((part_id, t))
+
+    if not tasks:
+        return jsonify(res)
+
+    # parallel shard reads (huge win on mac->gcs latency)
+    max_workers = 16
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_anchor_fetch_posting, pid, term) for pid, term in tasks]
+        for fut in as_completed(futs):
+            pl = fut.result()
+            for doc_id, _tf in pl:
+                match_counts[doc_id] += 1
+
+    if not match_counts:
+        return jsonify(res)
+
+    ranked = sorted(match_counts.items(), key=lambda x: (-x[1], x[0]))
+    return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _c in ranked])
+    # END SOLUTION
+
+
+@app.route("/get_pagerank", methods=["POST"])
 def get_pagerank():
-    ''' Returns PageRank values for a list of provided wiki article IDs. 
+    ''' Returns PageRank values for a list of provided wiki article IDs.
 
         Test this by issuing a POST request to a URL like:
           http://YOUR_SERVER_DOMAIN/get_pagerank
@@ -358,14 +763,16 @@ def get_pagerank():
     '''
     res = []
     wiki_ids = request.get_json()
-    if len(wiki_ids) == 0:
-      return jsonify(res)
+    if not wiki_ids:
+        return jsonify(res)
+
     # BEGIN SOLUTION
-
+    _ensure_pagerank_loaded()
+    return jsonify([_pr_of(int(i)) for i in wiki_ids])
     # END SOLUTION
-    return jsonify(res)
 
-@app.route("/get_pageview", methods=['POST'])
+
+@app.route("/get_pageview", methods=["POST"])
 def get_pageview():
     ''' Returns the number of page views that each of the provide wiki articles
         had in August 2021.
@@ -380,21 +787,25 @@ def get_pageview():
     Returns:
     --------
         list of ints:
-          list of page view numbers from August 2021 that correrspond to the 
+          list of page view numbers from August 2021 that correrspond to the
           provided list article IDs.
     '''
     res = []
     wiki_ids = request.get_json()
-    if len(wiki_ids) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
+    if not wiki_ids:
+        return jsonify(res)
 
+    # BEGIN SOLUTION
+    _ensure_pageview_loaded()  # missing -> zeros
+    return jsonify([_pv_of(int(i)) for i in wiki_ids])
     # END SOLUTION
-    return jsonify(res)
+
 
 def run(**options):
-    app.run(**options)
+    app.run(**options, debug=False, use_reloader=False)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     # run the Flask RESTful API, make the server publicly available (host='0.0.0.0') on port 8080
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    # for local testing you can still call it on 127.0.0.1:8080
+    app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
