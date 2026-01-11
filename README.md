@@ -3,6 +3,7 @@
 `gcloud compute instances start ir-frontend-1 --zone us-central1-c`
 - then test by fetching simple query :
 - `curl "http://35.222.160.75:8080/search_title?query=haifa"`
+- or try localy `curl http://127.0.0.1:8080/search_title?query=haifa`
 ## Overview
 This project implements a **functional, testable, and efficient search engine** over the full English Wikipedia corpus, developed as part of the Information Retrieval course.
 
@@ -16,7 +17,7 @@ The system exposes a REST API that allows querying the corpus using different re
 - **Port:** `8080`
 - **Uptime:** The server is deployed as a `systemd` service and is continuously available during the grading window.
 
-The service is accessible via:http://<VM_EXTERNAL_IP>:8080
+The service is accessible via:http://<35.222.160.75>:8080
 ---
 
 ## Implemented Endpoints
@@ -54,7 +55,7 @@ Returns up to 100 documents ranked using **TF-IDF cosine similarity over article
 ### `/search_anchor`
 Returns all documents ranked by the **number of query words appearing in anchor text** linking to the page.
 
-⚠️ This endpoint exists for completeness and experimentation, but **anchor usage is disabled by default** (see below).
+This endpoint exists for completeness and experimentation, but **anchor usage is disabled by default** (see below).
 
 ---
 

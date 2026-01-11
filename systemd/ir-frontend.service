@@ -1,0 +1,15 @@
+[Unit]
+Description=IR Search Frontend (Flask)
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment=PYTHONUNBUFFERED=1
+Environment=ENABLE_ANCHOR=0
+ExecStart=/home/ubuntu/venv/bin/python /home/ubuntu/search_frontend.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
