@@ -1,10 +1,35 @@
 # Information Retrieval Search Engine (Wikipedia Corpus)
-### for our convince the VM currently offline , to reactivate:
-`gcloud compute instances start ir-frontend-1 --zone us-central1-c`
-- then test by fetching simple query :
-- `curl "http://35.222.160.75:8080/search_title?query=haifa"`
-- or try localy `curl http://127.0.0.1:8080/search_title?query=haifa`
-### connect to the VM : `gcloud compute ssh ubuntu@ir-frontend-1 --zone us-central1-c --tunnel-through-iap`
+
+## Quick VM Commands
+
+Start the VM:
+```bash
+gcloud compute instances start ir-frontend-1 --zone us-central1-c
+```
+
+Sanity check:
+```bash
+curl "http://35.222.160.75:8080/search_title?query=haifa"
+```
+
+Connect to the VM:
+```bash
+gcloud compute ssh ubuntu@ir-frontend-1 --zone us-central1-c --tunnel-through-iap
+```
+
+Upload updated server code to the VM:
+```bash
+gcloud compute scp \
+  /Users/denis/PythonProject/Search_Engine_IR/search_frontend.py \
+  ubuntu@ir-frontend-1:/home/ubuntu/search_frontend.py \
+  --zone us-central1-c \
+  --tunnel-through-iap
+```
+
+Restart the service:
+```bash
+sudo systemctl restart ir-frontend.service
+```
 ## Overview
 This project implements a **functional, testable, and efficient search engine** over the full English Wikipedia corpus, developed as part of the Information Retrieval course.
 
@@ -36,21 +61,31 @@ This endpoint is:
 ---
 
 ### `/search`
-The **main retrieval endpoint**, combining multiple ranking signals:
+The **main retrieval endpoint used for grading**.
 
-1. **Body TF-IDF with cosine similarity** (candidate generation)
-2. **Title matches** (distinct query terms)
-3. **PageRank boost** (log-scaled)
-4. *(Optional)* Anchor text signal (runtime-controlled)
+Based on empirical evaluation, this endpoint defaults to a **title-only baseline**, which achieved the best effectiveness on the provided training queries.
 
-Results are merged deterministically and ranked from best to worst.
+**Final behavior (default):**
+- Ranks documents by the **number of distinct query terms appearing in the title**
+- Returns the top 100 results
+- Deterministic, fast, and stable
 
-Example: /search?query=database systems
+**Rationale:**
+Offline evaluation showed that the title-only method significantly outperformed body-based and combined approaches in MAP@10, while also providing much lower latency and higher stability.
+
+**Experimental combined retrieval** (body TF-IDF + title boost + PageRank + optional anchor) is preserved in the codebase and can be enabled explicitly using a runtime flag:
+
+```ini
+Environment=USE_COMBINED_SEARCH=1
+```
+
+By default, this flag is disabled to ensure optimal quality and efficiency during grading.
 ---
 
 ### `/search_body`
 Returns up to 100 documents ranked using **TF-IDF cosine similarity over article bodies only**.
 
+This endpoint is provided for completeness and experimentation. In offline evaluation, body-only TF-IDF without document-length normalization (BM25) yielded very low effectiveness on the training set, and is therefore not used in the final `/search` endpoint.
 ---
 
 ### `/search_anchor`
@@ -111,8 +146,15 @@ The search engine was evaluated using the **staff-provided training queries and 
 - **Metric:** Mean Average Precision at 10 (MAP@10)
 - **Evaluation method:** offline evaluation by issuing queries to the running `/search_title` endpoint and comparing the top-10 results against the ground truth.
 
-### Result : MAP@10 = 0.2167
-This score **exceeds the minimum required threshold (MAP@10 ≥ 0.1)** specified in the assignment instructions.
+### Results (MAP@10 on training set)
+
+| Endpoint        | MAP@10 |
+|-----------------|--------|
+| `/search_title` | 0.2167 |
+| `/search_body`  | 0.0000 |
+| `/search`       | 0.2167 |
+
+The combined retrieval approach (`/search` with body + title + PageRank) was evaluated but resulted in significantly lower effectiveness (MAP@10 ≈ 0.0004). Consequently, the final `/search` endpoint uses the title-only baseline, which comfortably exceeds the required threshold (MAP@10 ≥ 0.1).
 
 ---
 
@@ -128,5 +170,8 @@ This score **exceeds the minimum required threshold (MAP@10 ≥ 0.1)** specified
 
 ## Notes on Experimental Features
 
-Anchor-based retrieval was implemented and tested, but is **disabled by default** via a runtime flag due to performance and resource considerations.  
-The code and indexes were intentionally preserved to document alternative approaches and support potential bonus evaluation.
+Anchor-based retrieval was fully implemented and evaluated, including sharded anchor indexes, term-to-shard routing, and parallel shard fetching.
+
+During testing, enabling anchor scoring caused severe memory pressure and I/O overhead on the VM, leading to repeated server instability and crashes (OOM kills). Due to these constraints and the limited observed quality improvement, anchor usage is disabled by default via a runtime flag.
+
+The full implementation was intentionally preserved in the codebase to document the attempted approach and support potential bonus consideration.

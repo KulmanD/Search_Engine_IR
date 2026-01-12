@@ -12,7 +12,6 @@ from google.cloud import storage
 
 from inverted_index_gcp import InvertedIndex
 from concurrent.futures import ThreadPoolExecutor, as_completed
-ENABLE_ANCHOR = os.getenv("ENABLE_ANCHOR", "0") == "1"
 # ----------------------------
 # flask app
 # ----------------------------
@@ -35,6 +34,10 @@ BUCKET_NAME = "information-retrival-ex3"
 # set env ENABLE_ANCHOR=1 to enable anchor endpoints/scoring
 # default is OFF so we don't load anchor routing tables/shards unless needed.
 ENABLE_ANCHOR = os.getenv("ENABLE_ANCHOR", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# set env USE_COMBINED_SEARCH=1 to enable the experimental combined body+title+pr search.
+# default is OFF because on the provided train set it hurts MAP@10 vs title-only baseline.
+USE_COMBINED_SEARCH = os.getenv("USE_COMBINED_SEARCH", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # body
 BODY_BASE_DIR = "postings_gcp"  # gs://BUCKET/postings_gcp/...
@@ -372,61 +375,89 @@ def search():
         return jsonify(res)
 
     # BEGIN SOLUTION
-    # make sure our indexes (body and title) are loaded into memory so we can search them
-    if BODY_INDEX is None:
-        _load_body_index()
+    # load indexes (needed for both the baseline and the experimental combined mode)
     if TITLE_INDEX is None:
         _load_title_index()
+    _ensure_id2title_loaded()
+
+    # tokenize query
+    tokens = tokenize(query)
+    if not tokens:
+        return jsonify(res)
+
+    # ------------------------------
+    # default: title-only baseline
+    # ------------------------------
+    # we keep the combined logic below for the report/experimentation, but the title-only
+    # baseline is the best-performing method on the provided train set (MAP@10 ~ 0.2167).
+    if not USE_COMBINED_SEARCH:
+        q_terms = set(tokens)
+        match_counts = defaultdict(int)
+
+        for t in q_terms:
+            if TITLE_INDEX.df.get(t, 0) <= 0:
+                continue
+            try:
+                pl = TITLE_INDEX.read_a_posting_list(TITLE_BASE_DIR, t, bucket_name=BUCKET_NAME)
+            except Exception:
+                continue
+            for doc_id, _tf in pl:
+                match_counts[doc_id] += 1
+
+        if not match_counts:
+            return jsonify(res)
+
+        ranked = sorted(match_counts.items(), key=lambda x: (-x[1], x[0]))
+        ranked = ranked[:100]
+        return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _c in ranked])
+
+    # ------------------------------
+    # experimental: combined search
+    # ------------------------------
+    # this logic is preserved for the report, but must be explicitly enabled with
+    # USE_COMBINED_SEARCH=1.
+
+    # make sure body index is loaded (only needed in combined mode)
+    if BODY_INDEX is None:
+        _load_body_index()
 
     # ensure helper data structures are ready
-    _ensure_id2title_loaded()
     if ENABLE_ANCHOR:
         _ensure_term2bits_loaded()
     _ensure_pagerank_loaded()
-    _ensure_pageview_loaded()
-
-    # break the query into individual words
-    tokens = tokenize(query)
-    if not tokens: # if there are no valid words after tokenizing, return empty
-        return jsonify(res)
 
     # body tf-idf cosine (candidate generation)
-    q_tf = Counter(tokens) # count how many times each word appears in the query
-    N = _get_N_docs() # total number of documents in our corpus
+    q_tf = Counter(tokens)
+    N = _get_N_docs()
 
-    # calculate weights for query words. rare words get higher weight (idf)
     q_weights = {}
     for t, tf in q_tf.items():
-        df = BODY_INDEX.df.get(t, 0) # check how many docs contain this word
-        if df <= 0: # if the word isn't in our index, skip it
+        df = BODY_INDEX.df.get(t, 0)
+        if df <= 0:
             continue
         idf = math.log10(N / df)
         q_weights[t] = (tf / len(tokens)) * idf
 
-    # prepare dictionaries to hold scores and document lengths
     body_scores = defaultdict(float)
     body_doc_sq = defaultdict(float)
 
-    # for every word in the query, find matching documents
     for t, wq in q_weights.items():
         try:
-            # fetch the posting list from the bucket
             pl = BODY_INDEX.read_a_posting_list(BODY_BASE_DIR, t, bucket_name=BUCKET_NAME)
         except Exception:
             continue
 
-        df = BODY_INDEX.df.get(t, 0) # recalculate idf
+        df = BODY_INDEX.df.get(t, 0)
         if df <= 0:
             continue
         idf = math.log10(N / df)
 
-        # iterate over every doc that has this word
         for doc_id, tf in pl:
-            wd = (1.0 + math.log10(tf)) * idf # calculate weight for the doc
+            wd = (1.0 + math.log10(tf)) * idf
             body_scores[doc_id] += wq * wd
             body_doc_sq[doc_id] += wd * wd
 
-    q_norm = math.sqrt(sum(w * w for w in q_weights.values())) # normalize the scores
+    q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
     if q_norm > 0.0:
         for doc_id in list(body_scores.keys()):
             d_norm = math.sqrt(body_doc_sq.get(doc_id, 0.0))
@@ -435,37 +466,34 @@ def search():
             else:
                 body_scores[doc_id] = 0.0
 
-    body_top = _topk(body_scores, 200) # keep only the top 200 candidates from the body search to save time
+    body_top = _topk(body_scores, 200)
+    cand = set(doc_id for doc_id, _ in body_top)
 
-    # now check if query words appear in the title of documents
     title_scores = defaultdict(float)
     q_terms = set(tokens)
     for t in q_terms:
         if TITLE_INDEX.df.get(t, 0) <= 0:
             continue
         try:
-            # get list of docs having this word in their title
             pl = TITLE_INDEX.read_a_posting_list(TITLE_BASE_DIR, t, bucket_name=BUCKET_NAME)
         except Exception:
             continue
         for doc_id, _tf in pl:
-            title_scores[doc_id] += 1.0
+            if doc_id in cand:
+                title_scores[doc_id] += 1.0
 
-    #  anchor: number of query word occurrences that appear in anchor text
     anchor_scores = defaultdict(float)
     if ENABLE_ANCHOR:
         anchor_tasks = []
         for t in tokens:
-            # check which part of the index holds this term
             bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
             if bits == 0:
                 continue
-            for part_id in _iter_set_bits_u64(bits): # find the specific shard id
+            for part_id in _iter_set_bits_u64(bits):
                 if part_id >= ANCHOR_PARTS_N:
                     continue
                 anchor_tasks.append((part_id, t))
 
-        # if we have anchor tasks, run them using multiple threads to be faster
         if anchor_tasks:
             max_workers = 64
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -475,40 +503,33 @@ def search():
                     for doc_id, _tf in pl:
                         anchor_scores[doc_id] += 1.0
 
-    # merge
-    # set weights for different components of the score
     W_BODY = 1.0
     W_TITLE = 0.25
     W_ANCHOR = 0.20 if ENABLE_ANCHOR else 0.0
     W_PR = 0.10
-    W_PV = 0.0  # pageview file not present
+    W_PV = 0.0
 
     merged = defaultdict(float)
 
-    # start from body candidates
     for doc_id, s in body_top:
-        merged[doc_id] += W_BODY * float(s) # add weighted body scores to the final merged list
+        merged[doc_id] += W_BODY * float(s)
 
-    # add title + anchor (can introduce extra docs)
     for doc_id, s in title_scores.items():
-        merged[doc_id] += W_TITLE * float(s) # add weighted title scores
+        merged[doc_id] += W_TITLE * float(s)
     for doc_id, s in anchor_scores.items():
-        merged[doc_id] += W_ANCHOR * float(s) # add weighted anchor scores
+        merged[doc_id] += W_ANCHOR * float(s)
 
-    # iterate over all docs we found so far and add page rank boost
     for doc_id in list(merged.keys()):
         pr = _pr_of(int(doc_id))
         if pr > 0.0:
-            merged[doc_id] += W_PR * math.log1p(pr) # use log so high pagerank doesn't dominate too much
+            merged[doc_id] += W_PR * math.log1p(pr)
 
         if W_PV > 0.0:
             pv = _pv_of(int(doc_id))
             if pv > 0:
                 merged[doc_id] += W_PV * math.log1p(pv)
 
-    top = _topk(merged, 100) # get the final top 100 results
-
-    # return the results as a json list of tuples (id, title)
+    top = _topk(merged, 100)
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _ in top])
     # END SOLUTION
 
