@@ -4,6 +4,7 @@
 - then test by fetching simple query :
 - `curl "http://35.222.160.75:8080/search_title?query=haifa"`
 - or try localy `curl http://127.0.0.1:8080/search_title?query=haifa`
+### connect to the VM : `gcloud compute ssh ubuntu@ir-frontend-1 --zone us-central1-c --tunnel-through-iap`
 ## Overview
 This project implements a **functional, testable, and efficient search engine** over the full English Wikipedia corpus, developed as part of the Information Retrieval course.
 

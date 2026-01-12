@@ -91,9 +91,8 @@ def tokenize(text: str):
     return [t for t in tokens if t not in ALL_STOPWORDS]
 
 
-# ----------------------------
-# gcs helpers
-# ----------------------------
+#####################################
+# GCS + load once artifacts, runs once per process
 def _gcs_client():
     return storage.Client()
 
@@ -118,47 +117,6 @@ def _gcs_list_pickles(prefix: str):
             out.append(name)
     return sorted(out)
 
-
-def _auto_detect_index_name(base_dir: str):
-    """
-    Detect main index pickle name (without extension) under base_dir.
-    Skip *_posting_locs.pickle.
-    """
-    pickles = _gcs_list_pickles(base_dir)
-    candidates = []
-    for p in pickles:
-        base = p.split("/")[-1]
-        if "posting_locs" in base:
-            continue
-        if base.endswith(".pickle"):
-            candidates.append(base[:-7])
-        elif base.endswith(".pkl"):
-            candidates.append(base[:-4])
-    return candidates[0] if candidates else None
-
-
-# ----------------------------
-# load-once artifacts
-# ----------------------------
-def _ensure_id2title_loaded():
-    global ID2TITLE
-    if ID2TITLE is not None:
-        return
-    obj = _gcs_download_pickle(ID2TITLE_BLOB)
-    if obj is None:
-        print(f"[startup] id2title not found: gs://{BUCKET_NAME}/{ID2TITLE_BLOB} (using doc_id as title)")
-        ID2TITLE = {}
-        return
-    ID2TITLE = obj
-    print(f"[startup] loaded id2title entries: {len(ID2TITLE):,}")
-
-
-def _doc_to_title(doc_id: int) -> str:
-    if not ID2TITLE:
-        return str(doc_id)
-    return ID2TITLE.get(doc_id, str(doc_id))
-
-
 def _ensure_pagerank_loaded():
     global PAGERANK
     if PAGERANK is not None:
@@ -174,7 +132,6 @@ def _ensure_pagerank_loaded():
     except Exception:
         ln = -1
     print(f"[startup] loaded pagerank ({type(PAGERANK).__name__}), len={ln}")
-
 
 def _ensure_pageview_loaded():
     """
@@ -194,6 +151,83 @@ def _ensure_pageview_loaded():
     except Exception:
         ln = -1
     print(f"[startup] loaded pageview ({type(PAGEVIEW).__name__}), len={ln}")
+
+def _ensure_id2title_loaded():
+    global ID2TITLE
+    if ID2TITLE is not None:
+        return
+    obj = _gcs_download_pickle(ID2TITLE_BLOB)
+    if obj is None:
+        print(f"[startup] id2title not found: gs://{BUCKET_NAME}/{ID2TITLE_BLOB} (using doc_id as title)")
+        ID2TITLE = {}
+        return
+    ID2TITLE = obj
+    print(f"[startup] loaded id2title entries: {len(ID2TITLE):,}")
+
+def _ensure_term2bits_loaded():
+    global TERM2BITS
+    # anchor feature disabled -> never load term2parts
+    if not ENABLE_ANCHOR:
+        if TERM2BITS is None:
+            TERM2BITS = {}
+        return
+    if TERM2BITS is not None:
+        return
+    print(f"[startup] loading term2parts from gs://{BUCKET_NAME}/{TERM2PARTS_BLOB} ...")
+    obj = _gcs_download_pickle(TERM2PARTS_BLOB)
+    if obj is None:
+        print(f"[startup] term2parts not found: gs://{BUCKET_NAME}/{TERM2PARTS_BLOB}")
+        TERM2BITS = {}
+        return
+    TERM2BITS = obj
+    print(f"[startup] loaded term2parts terms: {len(TERM2BITS):,}")
+######################################
+
+# ---------------------------------------
+# loading  body/title index object from GCS to RAM
+def _load_body_index():
+    global BODY_INDEX
+    if BODY_INDEX is not None:
+        return
+    name = _auto_detect_index_name(BODY_BASE_DIR)
+    if name is None:
+        raise RuntimeError(f"no body index pickle found under gs://{BUCKET_NAME}/{BODY_BASE_DIR}/")
+    print(f"[startup] loading body index: gs://{BUCKET_NAME}/{BODY_BASE_DIR}/{name}.pickle")
+    BODY_INDEX = InvertedIndex.read_index(BODY_BASE_DIR, name, bucket_name=BUCKET_NAME)
+
+
+def _load_title_index():
+    global TITLE_INDEX
+    if TITLE_INDEX is not None:
+        return
+    print(f"[startup] loading title index: gs://{BUCKET_NAME}/{TITLE_BASE_DIR}/{TITLE_INDEX_NAME}.pkl")
+    TITLE_INDEX = InvertedIndex.read_index(TITLE_BASE_DIR, TITLE_INDEX_NAME, bucket_name=BUCKET_NAME)
+# ---------------------------------------
+
+def _auto_detect_index_name(base_dir: str):
+    """
+    Detect main index pickle name (without extension) under base_dir.
+    Skip *_posting_locs.pickle.
+    """
+    pickles = _gcs_list_pickles(base_dir)
+    candidates = []
+    for p in pickles:
+        base = p.split("/")[-1]
+        if "posting_locs" in base:
+            continue
+        if base.endswith(".pickle"):
+            candidates.append(base[:-7])
+        elif base.endswith(".pkl"):
+            candidates.append(base[:-4])
+    return candidates[0] if candidates else None
+
+# doc2part should have been useful assign docs to parts, or sometimes for optimizations.
+# In our current frontend code, it’s not used. our routing is term -> parts, not doc -> art.
+# shit idea, heavy on ram in run time
+def _doc_to_title(doc_id: int) -> str:
+    if not ID2TITLE:
+        return str(doc_id)
+    return ID2TITLE.get(doc_id, str(doc_id))
 
 
 def _pr_of(doc_id: int) -> float:
@@ -275,47 +309,6 @@ def debug_pagerank():
     })
 
 
-# ----------------------------
-# indexes
-# ----------------------------
-def _load_body_index():
-    global BODY_INDEX
-    if BODY_INDEX is not None:
-        return
-    name = _auto_detect_index_name(BODY_BASE_DIR)
-    if name is None:
-        raise RuntimeError(f"no body index pickle found under gs://{BUCKET_NAME}/{BODY_BASE_DIR}/")
-    print(f"[startup] loading body index: gs://{BUCKET_NAME}/{BODY_BASE_DIR}/{name}.pickle")
-    BODY_INDEX = InvertedIndex.read_index(BODY_BASE_DIR, name, bucket_name=BUCKET_NAME)
-
-
-def _load_title_index():
-    global TITLE_INDEX
-    if TITLE_INDEX is not None:
-        return
-    print(f"[startup] loading title index: gs://{BUCKET_NAME}/{TITLE_BASE_DIR}/{TITLE_INDEX_NAME}.pkl")
-    TITLE_INDEX = InvertedIndex.read_index(TITLE_BASE_DIR, TITLE_INDEX_NAME, bucket_name=BUCKET_NAME)
-
-
-def _ensure_term2bits_loaded():
-    global TERM2BITS
-    # anchor feature disabled -> never load term2parts
-    if not ENABLE_ANCHOR:
-        if TERM2BITS is None:
-            TERM2BITS = {}
-        return
-    if TERM2BITS is not None:
-        return
-    print(f"[startup] loading term2parts from gs://{BUCKET_NAME}/{TERM2PARTS_BLOB} ...")
-    obj = _gcs_download_pickle(TERM2PARTS_BLOB)
-    if obj is None:
-        print(f"[startup] term2parts not found: gs://{BUCKET_NAME}/{TERM2PARTS_BLOB}")
-        TERM2BITS = {}
-        return
-    TERM2BITS = obj
-    print(f"[startup] loaded term2parts terms: {len(TERM2BITS):,}")
-
-
 def _iter_set_bits_u64(bits: int):
     b = bits & ((1 << 64) - 1)
     while b:
@@ -323,6 +316,7 @@ def _iter_set_bits_u64(bits: int):
         i = (lsb.bit_length() - 1)
         yield i
         b ^= lsb
+
 def _anchor_fetch_posting(part_id: int, term: str):
     """fetch posting list for (term) from one anchor shard; returns list[(doc_id, tf)] or []"""
     try:
@@ -373,58 +367,66 @@ def search():
         element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get("query", "")
-    if len(query) == 0:
+    query = request.args.get("query", "") # get the query from the url
+    if len(query) == 0: # if the query is empty, just return an empty list immediately
         return jsonify(res)
 
     # BEGIN SOLUTION
+    # make sure our indexes (body and title) are loaded into memory so we can search them
     if BODY_INDEX is None:
         _load_body_index()
     if TITLE_INDEX is None:
         _load_title_index()
 
+    # ensure helper data structures are ready
     _ensure_id2title_loaded()
     if ENABLE_ANCHOR:
         _ensure_term2bits_loaded()
     _ensure_pagerank_loaded()
     _ensure_pageview_loaded()
 
+    # break the query into individual words
     tokens = tokenize(query)
-    if not tokens:
+    if not tokens: # if there are no valid words after tokenizing, return empty
         return jsonify(res)
 
-    # ---- body tf-idf cosine (candidate generation) ----
-    q_tf = Counter(tokens)
-    N = _get_N_docs()
+    # body tf-idf cosine (candidate generation)
+    q_tf = Counter(tokens) # count how many times each word appears in the query
+    N = _get_N_docs() # total number of documents in our corpus
 
+    # calculate weights for query words. rare words get higher weight (idf)
     q_weights = {}
     for t, tf in q_tf.items():
-        df = BODY_INDEX.df.get(t, 0)
-        if df <= 0:
+        df = BODY_INDEX.df.get(t, 0) # check how many docs contain this word
+        if df <= 0: # if the word isn't in our index, skip it
             continue
         idf = math.log10(N / df)
         q_weights[t] = (tf / len(tokens)) * idf
 
+    # prepare dictionaries to hold scores and document lengths
     body_scores = defaultdict(float)
     body_doc_sq = defaultdict(float)
 
+    # for every word in the query, find matching documents
     for t, wq in q_weights.items():
         try:
+            # fetch the posting list from the bucket
             pl = BODY_INDEX.read_a_posting_list(BODY_BASE_DIR, t, bucket_name=BUCKET_NAME)
         except Exception:
             continue
 
-        df = BODY_INDEX.df.get(t, 0)
+        df = BODY_INDEX.df.get(t, 0) # recalculate idf
         if df <= 0:
             continue
         idf = math.log10(N / df)
 
+        # iterate over every doc that has this word
         for doc_id, tf in pl:
-            wd = (1.0 + math.log10(tf)) * idf
+            wd = (1.0 + math.log10(tf)) * idf # calculate weight for the doc
             body_scores[doc_id] += wq * wd
             body_doc_sq[doc_id] += wd * wd
 
-    q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
+    q_norm = math.sqrt(sum(w * w for w in q_weights.values())) # normalize the scores
     if q_norm > 0.0:
         for doc_id in list(body_scores.keys()):
             d_norm = math.sqrt(body_doc_sq.get(doc_id, 0.0))
@@ -433,34 +435,37 @@ def search():
             else:
                 body_scores[doc_id] = 0.0
 
-    body_top = _topk(body_scores, 200)
+    body_top = _topk(body_scores, 200) # keep only the top 200 candidates from the body search to save time
 
-    # ---- title: distinct query words in title ----
+    # now check if query words appear in the title of documents
     title_scores = defaultdict(float)
     q_terms = set(tokens)
     for t in q_terms:
         if TITLE_INDEX.df.get(t, 0) <= 0:
             continue
         try:
+            # get list of docs having this word in their title
             pl = TITLE_INDEX.read_a_posting_list(TITLE_BASE_DIR, t, bucket_name=BUCKET_NAME)
         except Exception:
             continue
         for doc_id, _tf in pl:
             title_scores[doc_id] += 1.0
 
-    # ---- anchor: number of query word occurrences that appear in anchor text ----
+    #  anchor: number of query word occurrences that appear in anchor text
     anchor_scores = defaultdict(float)
     if ENABLE_ANCHOR:
         anchor_tasks = []
         for t in tokens:
+            # check which part of the index holds this term
             bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
             if bits == 0:
                 continue
-            for part_id in _iter_set_bits_u64(bits):
+            for part_id in _iter_set_bits_u64(bits): # find the specific shard id
                 if part_id >= ANCHOR_PARTS_N:
                     continue
                 anchor_tasks.append((part_id, t))
 
+        # if we have anchor tasks, run them using multiple threads to be faster
         if anchor_tasks:
             max_workers = 64
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -469,59 +474,41 @@ def search():
                     pl = fut.result()
                     for doc_id, _tf in pl:
                         anchor_scores[doc_id] += 1.0
-    # ---- anchor: number of query word occurrences that appear in anchor text ----
-    anchor_scores = defaultdict(float)
 
-    anchor_tasks = []
-    for t in tokens:  # keep duplicates per staff anchor spec
-        bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
-        if bits == 0:
-            continue
-        for part_id in _iter_set_bits_u64(bits):
-            if part_id >= ANCHOR_PARTS_N:
-                continue
-            anchor_tasks.append((part_id, t))
-
-    if anchor_tasks:
-        max_workers = 64
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(_anchor_fetch_posting, pid, term) for pid, term in anchor_tasks]
-            for fut in as_completed(futs):
-                pl = fut.result()
-                for doc_id, _tf in pl:
-                    anchor_scores[doc_id] += 1.0
-
-    # ---- merge (deterministic) ----
+    # merge
+    # set weights for different components of the score
     W_BODY = 1.0
     W_TITLE = 0.25
     W_ANCHOR = 0.20 if ENABLE_ANCHOR else 0.0
     W_PR = 0.10
-    W_PV = 0.0  # pageview file not present -> keep disabled for minimum
+    W_PV = 0.0  # pageview file not present
 
     merged = defaultdict(float)
 
     # start from body candidates
     for doc_id, s in body_top:
-        merged[doc_id] += W_BODY * float(s)
+        merged[doc_id] += W_BODY * float(s) # add weighted body scores to the final merged list
 
     # add title + anchor (can introduce extra docs)
     for doc_id, s in title_scores.items():
-        merged[doc_id] += W_TITLE * float(s)
+        merged[doc_id] += W_TITLE * float(s) # add weighted title scores
     for doc_id, s in anchor_scores.items():
-        merged[doc_id] += W_ANCHOR * float(s)
+        merged[doc_id] += W_ANCHOR * float(s) # add weighted anchor scores
 
-    # pagerank / pageview boosts (log-scaled)
+    # iterate over all docs we found so far and add page rank boost
     for doc_id in list(merged.keys()):
         pr = _pr_of(int(doc_id))
         if pr > 0.0:
-            merged[doc_id] += W_PR * math.log1p(pr)
+            merged[doc_id] += W_PR * math.log1p(pr) # use log so high pagerank doesn't dominate too much
 
         if W_PV > 0.0:
             pv = _pv_of(int(doc_id))
             if pv > 0:
                 merged[doc_id] += W_PV * math.log1p(pv)
 
-    top = _topk(merged, 100)
+    top = _topk(merged, 100) # get the final top 100 results
+
+    # return the results as a json list of tuples (id, title)
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _ in top])
     # END SOLUTION
 
@@ -543,16 +530,17 @@ def search_body():
         element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get("query", "")
-    if len(query) == 0:
+    query = request.args.get("query", "") # get the query string from the url
+    if len(query) == 0: # if the query is empty, return an empty list right away
         return jsonify(res)
 
     # BEGIN SOLUTION
+    # load the index that contains words from article bodies
     if BODY_INDEX is None:
         _load_body_index()
-    _ensure_id2title_loaded()
+    _ensure_id2title_loaded() # load the helper that converts doc ids to titles
 
-    tokens = tokenize(query)
+    tokens = tokenize(query) # split the query into words (tokens) using our helper function
     if not tokens:
         return jsonify(res)
 
@@ -575,6 +563,7 @@ def search_body():
 
     for t, wq in q_weights.items():
         try:
+            # fetch the list of documents that contain this word
             pl = BODY_INDEX.read_a_posting_list(BODY_BASE_DIR, t, bucket_name=BUCKET_NAME)
         except Exception:
             continue
@@ -584,15 +573,18 @@ def search_body():
             continue
         idf = math.log10(N / df)
 
+        # look at every document that has this query word
         for doc_id, tf in pl:
             wd = (1.0 + math.log10(tf)) * idf
             scores[doc_id] += wq * wd
             doc_sq[doc_id] += wd * wd
 
+    # calculate the length of the query vector
     q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
     if q_norm <= 0.0:
         return jsonify(res)
 
+    # normalize the scores for every document we found
     for doc_id in list(scores.keys()):
         d_norm = math.sqrt(doc_sq.get(doc_id, 0.0))
         if d_norm > 0.0:
@@ -601,9 +593,9 @@ def search_body():
             scores[doc_id] = 0.0
 
     top = _topk(scores, 100)
+    # return the results as a list of (id, title) tuples
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _ in top])
     # END SOLUTION
-
 
 @app.route("/search_title")
 def search_title():
@@ -627,38 +619,47 @@ def search_title():
         worst where each element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get("query", "")
-    if len(query) == 0:
+    query = request.args.get("query", "") # get the query string from the url
+    if len(query) == 0: # if the query is empty, return an empty list right away
         return jsonify(res)
 
-    # BEGIN SOLUTION
+    # ensure the title index is loaded into memory
     if TITLE_INDEX is None:
         _load_title_index()
-    _ensure_id2title_loaded()
+    _ensure_id2title_loaded() # ensure the id-to-title mapping helper is loaded
 
+    # tokenize the query string using the staff-provided tokenizer
     tokens = tokenize(query)
+    # if tokenization results in no terms, return empty list
     if not tokens:
         return jsonify(res)
 
+    # use a set to count distinct query terms only
     q_terms = set(tokens)
+    # dictionary to track how many distinct query terms each doc matches
     match_counts = defaultdict(int)
 
     for t in q_terms:
+        # skip terms that do not appear in the title index
         if TITLE_INDEX.df.get(t, 0) <= 0:
             continue
         try:
+            # fetch the posting list for the current term from the bucket
             pl = TITLE_INDEX.read_a_posting_list(TITLE_BASE_DIR, t, bucket_name=BUCKET_NAME)
         except Exception:
             continue
+        # increment the match count for every document containing this term
         for doc_id, _tf in pl:
             match_counts[doc_id] += 1
 
+    # if no documents matched any terms, return empty
     if not match_counts:
         return jsonify(res)
 
+    # sort results: primarily by match count (descending), secondarily by doc_id (ascending)
     ranked = sorted(match_counts.items(), key=lambda x: (-x[1], x[0]))
+    # return the sorted list of (id, title) tuples
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _c in ranked])
-    # END SOLUTION
 
 
 @app.route("/search_anchor")
@@ -686,40 +687,27 @@ def search_anchor():
     query = request.args.get("query", "")
     if len(query) == 0:
         return jsonify(res)
+
+    # feature flag: if anchor search is disabled in settings, stop here
     if not ENABLE_ANCHOR:
-        return jsonify(res)  # (or return ("disabled", 501) if you prefer)
+        return jsonify(res)
+
     # BEGIN SOLUTION
     _ensure_id2title_loaded()
     tokens = tokenize(query)
     if not tokens:
         return jsonify(res)
 
-    # match_counts = defaultdict(int)
-    #
-    # for t in tokens:  # keep duplicates per staff anchor spec
-    #     bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
-    #     if bits == 0:
-    #         continue
-    #
-    #     for part_id in _iter_set_bits_u64(bits):
-    #         if part_id >= ANCHOR_PARTS_N:
-    #             continue
-    #         try:
-    #             idx = _get_anchor_part_index(part_id)
-    #             pl = idx.read_a_posting_list(f"{ANCHOR_PARTS_DIR}/part_{part_id:03d}", t, bucket_name=BUCKET_NAME)
-    #         except Exception:
-    #             continue
-    #
-    #         for doc_id, _tf in pl:
-    #             match_counts[doc_id] += 1
     match_counts = defaultdict(int)
 
-    # build tasks: one (part_id, term) per relevant shard for that term
+    # identify which index partition (shard) holds each query term
     tasks = []
     for t in tokens:  # keep duplicates per staff anchor spec
+        # check our lookup map to see which file parts contain this term
         bits = int(TERM2BITS.get(t, 0)) if TERM2BITS is not None else 0
         if bits == 0:
             continue
+        # decode the bits to find specific partition IDs
         for part_id in _iter_set_bits_u64(bits):
             if part_id >= ANCHOR_PARTS_N:
                 continue
@@ -728,18 +716,20 @@ def search_anchor():
     if not tasks:
         return jsonify(res)
 
-    # parallel shard reads (huge win on mac->gcs latency)
+    # fetch data from multiple files at the same time (parallel) to speed up network reading
     max_workers = 16
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(_anchor_fetch_posting, pid, term) for pid, term in tasks]
         for fut in as_completed(futs):
             pl = fut.result()
+            # count how many query words point to this doc
             for doc_id, _tf in pl:
                 match_counts[doc_id] += 1
 
     if not match_counts:
         return jsonify(res)
 
+    # sort by number of matches (descending), then by doc_id (ascending)
     ranked = sorted(match_counts.items(), key=lambda x: (-x[1], x[0]))
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _c in ranked])
     # END SOLUTION
@@ -767,8 +757,8 @@ def get_pagerank():
         return jsonify(res)
 
     # BEGIN SOLUTION
-    _ensure_pagerank_loaded()
-    return jsonify([_pr_of(int(i)) for i in wiki_ids])
+    _ensure_pagerank_loaded() # make sure the pagerank dictionary is loaded from the pickle file
+    return jsonify([_pr_of(int(i)) for i in wiki_ids]) # lookup pagerank score for each id and return as a list
     # END SOLUTION
 
 
@@ -796,8 +786,8 @@ def get_pageview():
         return jsonify(res)
 
     # BEGIN SOLUTION
-    _ensure_pageview_loaded()  # missing -> zeros
-    return jsonify([_pv_of(int(i)) for i in wiki_ids])
+    _ensure_pageview_loaded() # ensure pageview data is loaded (if file is missing, this handles it gracefully)
+    return jsonify([_pv_of(int(i)) for i in wiki_ids]) # lookup pageview count for each id and return as a list
     # END SOLUTION
 
 
