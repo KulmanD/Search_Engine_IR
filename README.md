@@ -112,33 +112,14 @@ During testing, enabling anchor scoring caused severe memory pressure and I/O ov
 
 The full implementation was intentionally preserved in the codebase to document the attempted approach and support potential bonus consideration.
 
-## Quick VM Commands (for our use only)
+## Quick VM Commands
 
 Start the VM:
 ```bash
 gcloud compute instances start ir-frontend-1 --zone us-central1-c
 ```
 
-Sanity check:
-```bash
-curl "http://35.222.160.75:8080/search_title?query=haifa"
-```
-
 Connect to the VM:
 ```bash
 gcloud compute ssh ubuntu@ir-frontend-1 --zone us-central1-c --tunnel-through-iap
-```
-
-Upload updated server code to the VM:
-```bash
-gcloud compute scp \
-  /Users/denis/PythonProject/Search_Engine_IR/search_frontend.py \
-  ubuntu@ir-frontend-1:/home/ubuntu/search_frontend.py \
-  --zone us-central1-c \
-  --tunnel-through-iap
-```
-
-Restart the service:
-```bash
-sudo systemctl restart ir-frontend.service
 ```
