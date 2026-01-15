@@ -10,7 +10,7 @@ The system allows querying the corpus using different retrieval strategies (titl
 ---
 The service is accessible via:
 ---
-`http://<35.222.160.75>:8080`
+`http://35.222.160.75:8080`
 
 ## Implemented Endpoints
 
