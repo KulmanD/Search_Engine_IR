@@ -12,9 +12,6 @@ from google.cloud import storage
 
 from inverted_index_gcp import InvertedIndex
 from concurrent.futures import ThreadPoolExecutor, as_completed
-# ----------------------------
-# flask app
-# ----------------------------
 class MyFlaskApp(Flask):
     def run(self, host=None, port=None, debug=None, **options):
         super(MyFlaskApp, self).run(host=host, port=port, debug=debug, **options)
@@ -24,13 +21,12 @@ app = MyFlaskApp(__name__)
 app.config["JSONIFY_PRETTYPRINT_REGULAR"] = False
 
 
-# ----------------------------
-# gcs configuration (matches your current bucket)
-# ----------------------------
+
+# gcs configuration
 BUCKET_NAME = "information-retrival-ex3"
+
 # ----------------------------
 # runtime feature flags
-# ----------------------------
 # set env ENABLE_ANCHOR=1 to enable anchor endpoints/scoring
 # default is OFF so we don't load anchor routing tables/shards unless needed.
 ENABLE_ANCHOR = os.getenv("ENABLE_ANCHOR", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -48,8 +44,8 @@ TITLE_BASE_DIR = "title_postings_gcp/title_postings_gcp"
 TITLE_INDEX_NAME = "title_index"
 TITLE_INDEX = None  # InvertedIndex
 
-# anchor (sharded)
-ANCHOR_PARTS_DIR = "anchor_parts"  # gs://BUCKET/anchor_parts/part_000/...
+# anchor
+ANCHOR_PARTS_DIR = "anchor_parts"  # gs://BUCKET/anchor_parts/part_000/
 ANCHOR_PARTS_N = 60
 TERM2PARTS_BLOB = "anchor_parts/term2parts_u64.pkl"
 TERM2BITS = None  # dict[str,int] term -> uint64 bitset
@@ -57,18 +53,25 @@ TERM2BITS = None  # dict[str,int] term -> uint64 bitset
 # global artifacts
 ID2TITLE_BLOB = "artifacts/id2title.pickle"
 PAGERANK_BLOB = "artifacts/pagerank.pickle"
-PAGEVIEW_BLOB = "artifacts/pageview_aug2021.pickle"  # optional; not required for minimum
+PAGEVIEW_BLOB = "artifacts/pageview_aug2021.pickle" #wasnt very usefully to us after all
 
 ID2TITLE = None  # dict[int,str]
 PAGERANK = None  # dict or list
 PAGEVIEW = None  # dict or list (optional)
 
+
 N_DOCS_FALLBACK = 6348910
 
 
-# ----------------------------
-# tokenizer (staff tokenizer style from assignment 3)
-# ----------------------------
+# small helpers for runtime tuning via environment variables
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return float(default)
+
+
+# tokenizer
 RE_WORD = re.compile(r"""[\#\@\w](['\-]?\w){2,24}""", re.UNICODE)
 
 try:
@@ -153,7 +156,18 @@ def _ensure_pageview_loaded():
         ln = len(PAGEVIEW)
     except Exception:
         ln = -1
-    print(f"[startup] loaded pageview ({type(PAGEVIEW).__name__}), len={ln}")
+    # print a tiny sample of keys to detect keying scheme (int ids vs string ids vs titles)
+    sample = []
+    try:
+        if isinstance(PAGEVIEW, dict):
+            for i, k in enumerate(PAGEVIEW.keys()):
+                sample.append(str(k)[:80])
+                if i >= 4:
+                    break
+    except Exception:
+        sample = []
+
+    print(f"[startup] loaded pageview ({type(PAGEVIEW).__name__}), len={ln}, sample_keys={sample}")
 
 def _ensure_id2title_loaded():
     global ID2TITLE
@@ -169,7 +183,7 @@ def _ensure_id2title_loaded():
 
 def _ensure_term2bits_loaded():
     global TERM2BITS
-    # anchor feature disabled -> never load term2parts
+    # anchor feature disabled -> never load term2parts [had high hopes for this :-( ]
     if not ENABLE_ANCHOR:
         if TERM2BITS is None:
             TERM2BITS = {}
@@ -186,18 +200,15 @@ def _ensure_term2bits_loaded():
     print(f"[startup] loaded term2parts terms: {len(TERM2BITS):,}")
 ######################################
 
-# ---------------------------------------
 # loading  body/title index object from GCS to RAM
 def _load_body_index():
     global BODY_INDEX
     if BODY_INDEX is not None:
         return
-    name = _auto_detect_index_name(BODY_BASE_DIR)
-    if name is None:
-        raise RuntimeError(f"no body index pickle found under gs://{BUCKET_NAME}/{BODY_BASE_DIR}/")
-    print(f"[startup] loading body index: gs://{BUCKET_NAME}/{BODY_BASE_DIR}/{name}.pickle")
+    # force a known body index name
+    name = "index"  # gs://BUCKET/postings_gcp/index.pkl
+    print(f"[startup] loading body index: gs://{BUCKET_NAME}/{BODY_BASE_DIR}/{name}.pkl")
     BODY_INDEX = InvertedIndex.read_index(BODY_BASE_DIR, name, bucket_name=BUCKET_NAME)
-
 
 def _load_title_index():
     global TITLE_INDEX
@@ -205,12 +216,10 @@ def _load_title_index():
         return
     print(f"[startup] loading title index: gs://{BUCKET_NAME}/{TITLE_BASE_DIR}/{TITLE_INDEX_NAME}.pkl")
     TITLE_INDEX = InvertedIndex.read_index(TITLE_BASE_DIR, TITLE_INDEX_NAME, bucket_name=BUCKET_NAME)
-# ---------------------------------------
 
 def _auto_detect_index_name(base_dir: str):
     """
     Detect main index pickle name (without extension) under base_dir.
-    Skip *_posting_locs.pickle.
     """
     pickles = _gcs_list_pickles(base_dir)
     candidates = []
@@ -249,18 +258,39 @@ def _pr_of(doc_id: int) -> float:
 def _pv_of(doc_id: int) -> int:
     if not PAGEVIEW:
         return 0
+
+    # dict based pageview
     if isinstance(PAGEVIEW, dict):
+        # common case: keyed by int wiki_id
         if doc_id in PAGEVIEW:
             return int(PAGEVIEW.get(doc_id, 0))
-        return int(PAGEVIEW.get(str(doc_id), 0))
+
+        # sometimes keys are digit strings
+        s_id = str(doc_id)
+        if s_id in PAGEVIEW:
+            return int(PAGEVIEW.get(s_id, 0))
+
+        # sometimes the dict was created keyed by titles
+        # fall back to title lookup (safe but slower, only used if ids not found)
+        #we simple but fast boi
+        title = _doc_to_title(doc_id)
+        if title in PAGEVIEW:
+            try:
+                return int(PAGEVIEW.get(title, 0))
+            except Exception:
+                return 0
+
+        return 0
+
+    # list-based pageview (indexed by doc_id)
     if 0 <= doc_id < len(PAGEVIEW):
         return int(PAGEVIEW[doc_id])
+
     return 0
 
 
-# ----------------------------
+
 # debug endpoints (safe to keep; not used by graders)
-# ----------------------------
 @app.route("/debug_pagerank")
 def debug_pagerank():
     """debug: verify pagerank loaded + key type + sample values"""
@@ -269,7 +299,7 @@ def debug_pagerank():
     if not PAGERANK:
         return jsonify({"loaded": False, "type": None, "len": 0})
 
-    # dict-based pagerank
+    # dict based pagerank
     if isinstance(PAGERANK, dict):
         keys = list(PAGERANK.keys())
         sample_keys = keys[:5]
@@ -279,7 +309,6 @@ def debug_pagerank():
                 sample.append([str(k), float(PAGERANK.get(k, 0.0))])
             except Exception:
                 sample.append([str(k), 0.0])
-
         return jsonify({
             "loaded": True,
             "type": "dict",
@@ -291,17 +320,14 @@ def debug_pagerank():
             "val_5": _pr_of(5),
             "val_8": _pr_of(8),
         })
-
     # list-based pagerank
     try:
         ln = len(PAGERANK)
     except Exception:
         ln = -1
-
     v1 = float(PAGERANK[1]) if ln > 1 else None
     v5 = float(PAGERANK[5]) if ln > 5 else None
     v8 = float(PAGERANK[8]) if ln > 8 else None
-
     return jsonify({
         "loaded": True,
         "type": "list",
@@ -334,9 +360,7 @@ def _get_anchor_part_index(part_id: int) -> InvertedIndex:
     return InvertedIndex.read_index(base_dir, "anchor_index", bucket_name=BUCKET_NAME)
 
 
-# ----------------------------
 # scoring helpers
-# ----------------------------
 def _get_N_docs():
     return N_DOCS_FALLBACK
 
@@ -347,10 +371,6 @@ def _topk(score_dict, k: int):
     # stable: score desc, doc_id asc
     return sorted(score_dict.items(), key=lambda x: (-x[1], x[0]))[:k]
 
-
-# ----------------------------
-# endpoints (staff template signatures)
-# ----------------------------
 @app.route("/search")
 def search():
     ''' Returns up to a 100 of your best search results for the query. This is
@@ -385,7 +405,6 @@ def search():
     if not tokens:
         return jsonify(res)
 
-    # ------------------------------
     # default: title-only baseline
     # ------------------------------
     # we keep the combined logic below for the report/experimentation, but the title-only
@@ -406,17 +425,26 @@ def search():
 
         if not match_counts:
             return jsonify(res)
+        _ensure_pagerank_loaded()
+        _ensure_pageview_loaded()
 
-        ranked = sorted(match_counts.items(), key=lambda x: (-x[1], x[0]))
-        ranked = ranked[:100]
+        def _key(item):
+            doc_id, cnt = item
+            d = int(doc_id)
+            pr = _pr_of(d)
+            pv = _pv_of(d)
+            # primary: title match count
+            # secondary: pagerank (soft log)
+            # third: pageview (soft log)
+            # last but not least: doc_id (stable)
+            return (-cnt, -math.log1p(pr), -math.log1p(pv), d)
+
+        ranked = sorted(match_counts.items(), key=_key)[:100]
         return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _c in ranked])
 
-    # ------------------------------
-    # experimental: combined search
-    # ------------------------------
+    # #@#@ experimental #@#@   --- > combined search
     # this logic is preserved for the report, but must be explicitly enabled with
     # USE_COMBINED_SEARCH=1.
-
     # make sure body index is loaded (only needed in combined mode)
     if BODY_INDEX is None:
         _load_body_index()
@@ -426,10 +454,9 @@ def search():
         _ensure_term2bits_loaded()
     _ensure_pagerank_loaded()
 
-    # body tf-idf cosine (candidate generation)
+    # body tfidf cosine
     q_tf = Counter(tokens)
     N = _get_N_docs()
-
     q_weights = {}
     for t, tf in q_tf.items():
         df = BODY_INDEX.df.get(t, 0)
@@ -437,26 +464,21 @@ def search():
             continue
         idf = math.log10(N / df)
         q_weights[t] = (tf / len(tokens)) * idf
-
     body_scores = defaultdict(float)
     body_doc_sq = defaultdict(float)
-
     for t, wq in q_weights.items():
         try:
             pl = BODY_INDEX.read_a_posting_list(BODY_BASE_DIR, t, bucket_name=BUCKET_NAME)
         except Exception:
             continue
-
         df = BODY_INDEX.df.get(t, 0)
         if df <= 0:
             continue
         idf = math.log10(N / df)
-
         for doc_id, tf in pl:
             wd = (1.0 + math.log10(tf)) * idf
             body_scores[doc_id] += wq * wd
             body_doc_sq[doc_id] += wd * wd
-
     q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
     if q_norm > 0.0:
         for doc_id in list(body_scores.keys()):
@@ -468,7 +490,6 @@ def search():
 
     body_top = _topk(body_scores, 200)
     cand = set(doc_id for doc_id, _ in body_top)
-
     title_scores = defaultdict(float)
     q_terms = set(tokens)
     for t in q_terms:
@@ -503,32 +524,30 @@ def search():
                     for doc_id, _tf in pl:
                         anchor_scores[doc_id] += 1.0
 
-    W_BODY = 1.0
-    W_TITLE = 0.25
-    W_ANCHOR = 0.20 if ENABLE_ANCHOR else 0.0
-    W_PR = 0.10
-    W_PV = 0.0
+    # weights (tunable via env vars so we can test without editing code)
+    # defaults keep behavior identical unless we explicitly set our env variavbles.
+    W_BODY = _env_float("W_BODY", 1.0)
+    W_TITLE = _env_float("W_TITLE", 0.25)
+    W_ANCHOR = _env_float("W_ANCHOR", 0.20) if ENABLE_ANCHOR else 0.0
+    W_PR = _env_float("W_PR", 0.10)
+    W_PV = _env_float("W_PV", 0.0)
 
     merged = defaultdict(float)
-
     for doc_id, s in body_top:
         merged[doc_id] += W_BODY * float(s)
-
     for doc_id, s in title_scores.items():
         merged[doc_id] += W_TITLE * float(s)
     for doc_id, s in anchor_scores.items():
         merged[doc_id] += W_ANCHOR * float(s)
-
     for doc_id in list(merged.keys()):
         pr = _pr_of(int(doc_id))
         if pr > 0.0:
             merged[doc_id] += W_PR * math.log1p(pr)
-
         if W_PV > 0.0:
+            _ensure_pageview_loaded()
             pv = _pv_of(int(doc_id))
             if pv > 0:
                 merged[doc_id] += W_PV * math.log1p(pv)
-
     top = _topk(merged, 100)
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _ in top])
     # END SOLUTION
@@ -551,8 +570,8 @@ def search_body():
         element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get("query", "") # get the query string from the url
-    if len(query) == 0: # if the query is empty, return an empty list right away
+    query = request.args.get("query", "")
+    if len(query) == 0:
         return jsonify(res)
 
     # BEGIN SOLUTION
@@ -561,13 +580,11 @@ def search_body():
         _load_body_index()
     _ensure_id2title_loaded() # load the helper that converts doc ids to titles
 
-    tokens = tokenize(query) # split the query into words (tokens) using our helper function
+    tokens = tokenize(query) # split the query into tokens using our helper function
     if not tokens:
         return jsonify(res)
-
     q_tf = Counter(tokens)
     N = _get_N_docs()
-
     q_weights = {}
     for t, tf in q_tf.items():
         df = BODY_INDEX.df.get(t, 0)
@@ -575,26 +592,21 @@ def search_body():
             continue
         idf = math.log10(N / df)
         q_weights[t] = (tf / len(tokens)) * idf
-
     if not q_weights:
         return jsonify(res)
-
     scores = defaultdict(float)
     doc_sq = defaultdict(float)
-
     for t, wq in q_weights.items():
         try:
             # fetch the list of documents that contain this word
             pl = BODY_INDEX.read_a_posting_list(BODY_BASE_DIR, t, bucket_name=BUCKET_NAME)
         except Exception:
             continue
-
         df = BODY_INDEX.df.get(t, 0)
         if df <= 0:
             continue
         idf = math.log10(N / df)
-
-        # look at every document that has this query word
+        # look at every dcument that has this query word
         for doc_id, tf in pl:
             wd = (1.0 + math.log10(tf)) * idf
             scores[doc_id] += wq * wd
@@ -604,7 +616,6 @@ def search_body():
     q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
     if q_norm <= 0.0:
         return jsonify(res)
-
     # normalize the scores for every document we found
     for doc_id in list(scores.keys()):
         d_norm = math.sqrt(doc_sq.get(doc_id, 0.0))
@@ -612,7 +623,6 @@ def search_body():
             scores[doc_id] /= (q_norm * d_norm)
         else:
             scores[doc_id] = 0.0
-
     top = _topk(scores, 100)
     # return the results as a list of (id, title) tuples
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _ in top])
@@ -640,26 +650,22 @@ def search_title():
         worst where each element is a tuple (wiki_id, title).
     '''
     res = []
-    query = request.args.get("query", "") # get the query string from the url
-    if len(query) == 0: # if the query is empty, return an empty list right away
+    query = request.args.get("query", "")
+    if len(query) == 0:
         return jsonify(res)
 
     # ensure the title index is loaded into memory
     if TITLE_INDEX is None:
         _load_title_index()
-    _ensure_id2title_loaded() # ensure the id-to-title mapping helper is loaded
-
-    # tokenize the query string using the staff-provided tokenizer
-    tokens = tokenize(query)
-    # if tokenization results in no terms, return empty list
-    if not tokens:
+    _ensure_id2title_loaded() # ensure the id to title mapping helper is loaded
+    tokens = tokenize(query)  # tokenize
+    if not tokens:     # if tokenization results in no terms, return empty list
         return jsonify(res)
 
     # use a set to count distinct query terms only
     q_terms = set(tokens)
     # dictionary to track how many distinct query terms each doc matches
     match_counts = defaultdict(int)
-
     for t in q_terms:
         # skip terms that do not appear in the title index
         if TITLE_INDEX.df.get(t, 0) <= 0:
@@ -672,12 +678,10 @@ def search_title():
         # increment the match count for every document containing this term
         for doc_id, _tf in pl:
             match_counts[doc_id] += 1
-
     # if no documents matched any terms, return empty
     if not match_counts:
         return jsonify(res)
-
-    # sort results: primarily by match count (descending), secondarily by doc_id (ascending)
+    # sort results: primarily by match count, secondarily by doc_id (ascending)
     ranked = sorted(match_counts.items(), key=lambda x: (-x[1], x[0]))
     # return the sorted list of (id, title) tuples
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _c in ranked])
@@ -721,7 +725,7 @@ def search_anchor():
 
     match_counts = defaultdict(int)
 
-    # identify which index partition (shard) holds each query term
+    # identify which index partition (part) holds each query term
     tasks = []
     for t in tokens:  # keep duplicates per staff anchor spec
         # check our lookup map to see which file parts contain this term
@@ -733,11 +737,9 @@ def search_anchor():
             if part_id >= ANCHOR_PARTS_N:
                 continue
             tasks.append((part_id, t))
-
     if not tasks:
         return jsonify(res)
-
-    # fetch data from multiple files at the same time (parallel) to speed up network reading
+    # fetch data from multiple files at the same time to speed up network reading
     max_workers = 16
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(_anchor_fetch_posting, pid, term) for pid, term in tasks]
@@ -746,11 +748,9 @@ def search_anchor():
             # count how many query words point to this doc
             for doc_id, _tf in pl:
                 match_counts[doc_id] += 1
-
     if not match_counts:
         return jsonify(res)
-
-    # sort by number of matches (descending), then by doc_id (ascending)
+    # sort by number of matches , then by doc_id (ascending)
     ranked = sorted(match_counts.items(), key=lambda x: (-x[1], x[0]))
     return jsonify([(int(doc_id), _doc_to_title(int(doc_id))) for doc_id, _c in ranked])
     # END SOLUTION
@@ -776,7 +776,6 @@ def get_pagerank():
     wiki_ids = request.get_json()
     if not wiki_ids:
         return jsonify(res)
-
     # BEGIN SOLUTION
     _ensure_pagerank_loaded() # make sure the pagerank dictionary is loaded from the pickle file
     return jsonify([_pr_of(int(i)) for i in wiki_ids]) # lookup pagerank score for each id and return as a list
@@ -805,9 +804,8 @@ def get_pageview():
     wiki_ids = request.get_json()
     if not wiki_ids:
         return jsonify(res)
-
     # BEGIN SOLUTION
-    _ensure_pageview_loaded() # ensure pageview data is loaded (if file is missing, this handles it gracefully)
+    _ensure_pageview_loaded() # ensure pageview data is loaded
     return jsonify([_pv_of(int(i)) for i in wiki_ids]) # lookup pageview count for each id and return as a list
     # END SOLUTION
 
@@ -818,5 +816,4 @@ def run(**options):
 
 if __name__ == "__main__":
     # run the Flask RESTful API, make the server publicly available (host='0.0.0.0') on port 8080
-    # for local testing you can still call it on 127.0.0.1:8080
     app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
